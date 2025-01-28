@@ -2,7 +2,6 @@ requests>=2.31.0
 rich>=13.7.0
 langchain-core>=0.1.30
 langchain-community>=0.0.24
-langchain-huggingface>=0.0.12
 langchain-chroma>=0.0.14
 pydantic>=2.6.3
 cryptography>=42.0.5

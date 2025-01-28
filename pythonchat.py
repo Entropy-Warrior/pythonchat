@@ -22,7 +22,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.embeddings import Embeddings
 from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
+from sentence_transformers import SentenceTransformer
 
 # Third-party imports - Other
 import requests
@@ -268,11 +268,7 @@ class HybridMemory:
                     os.makedirs(Config.STORAGE["models"], exist_ok=True)
             
             debug_print(f"Initializing embeddings with model: {embedding_model}")
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name=embedding_model,
-                cache_folder=Config.STORAGE["models"],
-                encode_kwargs={'normalize_embeddings': True}
-            )
+            self.embeddings = SentenceTransformer(embedding_model)
             debug_print("Embeddings initialized successfully")
             
         except Exception as e:
@@ -465,6 +461,17 @@ class ChatBot:
         
         # Initialize chat model (will be set when model is selected)
         self.chat_model = None
+        
+        # Initialize embeddings with local model
+        model_path = os.path.join(Config.STORAGE["models"], Config.MODEL_SETTINGS["name"])
+        self.embeddings = SentenceTransformer(model_path)
+        
+        # Initialize vector store
+        self.vector_store = Chroma(
+            collection_name="chat_history",
+            embedding_function=self.embeddings,
+            persist_directory=os.path.join(Config.STORAGE["models"], "chroma")
+        )
     
     # =====================================
     # System Prompt Management
