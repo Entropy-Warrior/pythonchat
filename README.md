@@ -9,9 +9,11 @@ A terminal-based chatbot using OpenRouter API with LangChain integration. Featur
 - Token usage and cost tracking
 - Encrypted API key storage
 - Beautiful terminal UI using Rich
-- Docker support for easy deployment
+- Docker support for easy deployment with pre-downloaded model
 
 ## Quick Start with Docker
+
+The Docker image comes with the embedding model pre-installed:
 
 ```bash
 # Pull the image
@@ -19,7 +21,6 @@ docker pull ghcr.io/entropy-warrior/pythonchat:latest
 
 # Run the container
 docker run -it \
-  -v $(pwd)/storage/models:/app/storage/models \
   -v $(pwd)/storage/config:/app/storage/config \
   -v $(pwd)/storage/history:/app/storage/history \
   ghcr.io/entropy-warrior/pythonchat:latest
@@ -38,7 +39,7 @@ cd pythonchat
 pip install -r requirements.txt
 ```
 
-3. Download the embedding model:
+3. Download the embedding model (not needed if using Docker):
 ```bash
 python download_model.py
 ```
@@ -66,7 +67,7 @@ python pythonchat.py
 
 ## Docker Build
 
-To build the Docker image locally:
+To build the Docker image locally (includes downloading the model):
 
 ```bash
 docker build -t pythonchat .

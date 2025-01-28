@@ -22,7 +22,10 @@ RUN mkdir -p /app/storage/models \
     && chmod -R 777 /app/storage
 
 # Copy application code
-COPY pythonchat.py .
+COPY pythonchat.py download_model.py ./
+
+# Download the model during build
+RUN python download_model.py
 
 # Set environment variables
 ENV MODELS_DIR=/app/storage/models
@@ -33,4 +36,4 @@ ENV HISTORY_DIR=/app/storage/history
 VOLUME ["/app/storage/models", "/app/storage/config", "/app/storage/history"]
 
 # Set the default command
-CMD ["python", "pythonchat.py"] 
+CMD ["python", "pythonchat.py"]
