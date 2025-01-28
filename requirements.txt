@@ -1,0 +1,11 @@
+requests
+rich
+langchain-core
+langchain-community
+langchain-huggingface
+langchain-chroma
+pydantic
+cryptography
+tiktoken
+chromadb
+sentence-transformers 
