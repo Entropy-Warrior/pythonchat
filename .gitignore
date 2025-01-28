@@ -33,6 +33,15 @@ storage/
 chat_memory.json
 chat_context.json
 
+# Model files
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+models_cache.json
+
 # IDE
 .idea/
 .vscode/
