@@ -5,6 +5,10 @@ import base64
 from datetime import datetime, timedelta
 from getpass import getpass
 from typing import Any, Dict, List, Optional
+import urllib3
+
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Third-party imports - UI
 from rich.console import Console
@@ -23,6 +27,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.embeddings import Embeddings
 from langchain_chroma import Chroma
 from sentence_transformers import SentenceTransformer
+import numpy as np
 
 # Third-party imports - Other
 import requests
@@ -37,6 +42,26 @@ console = Console()
 DEBUG_MODE = False
 
 # =====================================
+# Embeddings Implementation
+# =====================================
+class LocalEmbeddings(Embeddings):
+    """Local embeddings using pre-downloaded model."""
+    
+    def __init__(self, model_path: str):
+        """Initialize with local model path."""
+        self.model = SentenceTransformer(model_path, device="cpu")
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embed a list of documents."""
+        embeddings = self.model.encode(texts, convert_to_numpy=True)
+        return embeddings.tolist()
+    
+    def embed_query(self, text: str) -> List[float]:
+        """Embed a query."""
+        embedding = self.model.encode([text], convert_to_numpy=True)[0]
+        return embedding.tolist()
+
+# =====================================
 # Configuration and Settings
 # =====================================
 class Config:
@@ -44,6 +69,9 @@ class Config:
     # API Configuration
     ENCRYPTED_API_KEY = "gAAAAABnmEo__06SYg3CsTS3uNbJt_5OvUS7Tt4qjInT_fwWE88b8ihOzrkVUP5GKbxZpyHmGpYSn4halGuvUik2ypooRfjMWtZhylglkUpnGXu9HFmmuyrzj9go4Ils2c0cg5GNNI5ZrCucYqfiZRixisQCT2CmLPsv8RKv8YEms5N3zkbgevA="
     SALT = b'\xf8S\x92\xfa\xb6\x16\xe1$\xd2\x9a*`\xe2_~D'
+    
+    # SSL Settings
+    VERIFY_SSL = False  # Global setting for SSL verification
     
     # API Endpoints
     ENDPOINTS = {
@@ -198,7 +226,8 @@ class ChatModel(BaseChatModel):
             headers=self.headers, 
             json=data, 
             stream=True,
-            timeout=Config.MODEL_SETTINGS["timeout"]
+            timeout=Config.MODEL_SETTINGS["timeout"],
+            verify=Config.VERIFY_SSL
         )
         response.raise_for_status()
         
@@ -267,7 +296,7 @@ class HybridMemory:
                 )
             
             debug_print(f"Initializing embeddings with local model: {embedding_model}")
-            self.embeddings = SentenceTransformer(embedding_model, device="cpu")
+            self.embeddings = LocalEmbeddings(embedding_model)
             debug_print("Embeddings initialized successfully")
             
         except Exception as e:
@@ -496,7 +525,7 @@ class ChatBot:
     def _make_request(self, endpoint, method="get", **kwargs):
         """Make an HTTP request to OpenRouter API."""
         url = f"{Config.API_ENDPOINT}/{endpoint}"
-        response = requests.request(method, url, headers=self.headers, **kwargs)
+        response = requests.request(method, url, headers=self.headers, verify=Config.VERIFY_SSL, **kwargs)
         response.raise_for_status()
         return response.json()
     
@@ -817,7 +846,8 @@ class ChatBot:
                         "model": self.model,
                         "messages": formatted_messages,
                         "stream": False
-                    }
+                    },
+                    verify=Config.VERIFY_SSL
                 )
                 stats_response.raise_for_status()
                 stats_data = stats_response.json()
