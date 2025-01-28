@@ -10,6 +10,7 @@ A terminal-based chatbot using OpenRouter API with LangChain integration. Featur
 - Encrypted API key storage
 - Beautiful terminal UI using Rich
 - Docker support for easy deployment with pre-downloaded model
+- Automatic fallback to backup API endpoint for reliability
 
 ## Quick Start with Docker
 
@@ -55,6 +56,15 @@ python pythonchat.py
 - `CONFIG_DIR`: Directory for configuration files (default: 'storage/config')
 - `HISTORY_DIR`: Directory for chat history (default: 'storage/history')
 
+## API Endpoints
+
+The application uses OpenRouter.ai as the primary API endpoint and automatically falls back to a backup endpoint (wangscience.com) if the primary is unavailable. This ensures:
+
+- Higher availability
+- Automatic failover
+- Seamless recovery
+- No interruption in service
+
 ## Commands
 
 - `exit`, `quit`: Exit the application
@@ -76,4 +86,4 @@ docker run -it pythonchat
 
 ## License
 
-MIT License 
+MIT License

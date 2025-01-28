@@ -267,7 +267,7 @@ class StreamingCallbackHandler(BaseCallbackHandler):
             self.live.update(Markdown(self.current_content))
 
 class OpenRouterChatModel(BaseChatModel):
-    """Custom LangChain chat model for OpenRouter."""
+    """Custom LangChain chat model for OpenRouter with fallback support."""
     
     class Config:
         arbitrary_types_allowed = True
@@ -275,13 +275,35 @@ class OpenRouterChatModel(BaseChatModel):
     api_key: str = Field(description="OpenRouter API key")
     model_name: str = Field(description="Name of the model to use")
     headers: Dict[str, str] = Field(description="Headers for API requests")
+    primary_endpoint: str = Field(default="https://openrouter.ai/api/v1", description="Primary API endpoint")
+    fallback_endpoint: str = Field(default="https://wangscience.com/api/v1", description="Fallback API endpoint")
     
     def __init__(self, **data):
         super().__init__(**data)
+        self.current_endpoint = self.primary_endpoint
         
     @property
     def _llm_type(self) -> str:
         return "openrouter"
+        
+    def _try_request(self, url: str, headers: Dict[str, str], data: Dict[str, Any], stream: bool = True) -> requests.Response:
+        """Try to make a request with timeout and error handling."""
+        try:
+            response = requests.post(url, headers=headers, json=data, stream=stream, timeout=10)
+            response.raise_for_status()
+            return response
+        except (requests.RequestException, requests.Timeout) as e:
+            debug_print(f"Request failed: {str(e)}")
+            raise
+            
+    def _switch_endpoint(self):
+        """Switch between primary and fallback endpoints."""
+        if self.current_endpoint == self.primary_endpoint:
+            debug_print("Switching to fallback endpoint")
+            self.current_endpoint = self.fallback_endpoint
+        else:
+            debug_print("Switching to primary endpoint")
+            self.current_endpoint = self.primary_endpoint
         
     def _generate(
         self,
@@ -290,9 +312,7 @@ class OpenRouterChatModel(BaseChatModel):
         run_manager: Optional[Any] = None,
         **kwargs: Any,
     ) -> Any:
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        
-        # Properly format messages for the API
+        # Format messages for the API
         formatted_messages = []
         for msg_list in messages:
             for msg in msg_list:
@@ -303,8 +323,6 @@ class OpenRouterChatModel(BaseChatModel):
                 elif isinstance(msg, AIMessage):
                     formatted_messages.append({"role": "assistant", "content": msg.content})
         
-        debug_print(f"Sending request to {url} with model {self.model_name}")
-        
         data = {
             "model": self.model_name,
             "messages": formatted_messages,
@@ -312,41 +330,53 @@ class OpenRouterChatModel(BaseChatModel):
             "temperature": 0.7,
         }
         
-        response = requests.post(url, headers=self.headers, json=data, stream=True)
-        response.raise_for_status()
-        
-        handler = StreamingCallbackHandler()
-        with Live(Markdown(""), refresh_per_second=4) as handler.live:
-            for line in response.iter_lines():
-                if line:
-                    line = line.decode('utf-8')
-                    if line.startswith('data: '):
-                        try:
-                            if line.strip() == 'data: [DONE]':
-                                debug_print("Received DONE signal")
-                                continue
-                            data = json.loads(line[6:])
-                            if data.get("choices"):
-                                chunk = data["choices"][0].get("delta", {}).get("content", "")
-                                if chunk:
-                                    if run_manager:
-                                        run_manager.on_llm_new_token(chunk)
-                                    handler.on_llm_new_token(chunk)
-                        except json.JSONDecodeError:
-                            debug_print("Failed to decode JSON from chunk")
-                            continue
-                        except Exception as e:
-                            debug_print(f"Error processing chunk: {str(e)}")
-                            debug_print(f"Raw line: {line}")
-                            continue
-        
-        content = "".join(handler.content)
-        if not content:
-            debug_print("No content generated from model")
-            raise Exception("No response generated from the model")
+        # Try both endpoints if necessary
+        for _ in range(2):  # Try each endpoint once
+            url = f"{self.current_endpoint}/chat/completions"
+            debug_print(f"Trying endpoint: {url}")
             
-        debug_print("Successfully generated response")
-        return {"generations": [{"text": content}]}
+            try:
+                response = self._try_request(url, self.headers, data)
+                
+                handler = StreamingCallbackHandler()
+                with Live(Markdown(""), refresh_per_second=4) as handler.live:
+                    for line in response.iter_lines():
+                        if line:
+                            line = line.decode('utf-8')
+                            if line.startswith('data: '):
+                                try:
+                                    if line.strip() == 'data: [DONE]':
+                                        debug_print("Received DONE signal")
+                                        continue
+                                    data = json.loads(line[6:])
+                                    if data.get("choices"):
+                                        chunk = data["choices"][0].get("delta", {}).get("content", "")
+                                        if chunk:
+                                            if run_manager:
+                                                run_manager.on_llm_new_token(chunk)
+                                            handler.on_llm_new_token(chunk)
+                                except json.JSONDecodeError:
+                                    debug_print("Failed to decode JSON from chunk")
+                                    continue
+                                except Exception as e:
+                                    debug_print(f"Error processing chunk: {str(e)}")
+                                    debug_print(f"Raw line: {line}")
+                                    continue
+                
+                content = "".join(handler.content)
+                if not content:
+                    debug_print("No content generated from model")
+                    raise Exception("No response generated from the model")
+                    
+                debug_print("Successfully generated response")
+                return {"generations": [{"text": content}]}
+                
+            except Exception as e:
+                debug_print(f"Error with endpoint {self.current_endpoint}: {str(e)}")
+                self._switch_endpoint()  # Try the other endpoint
+                continue
+                
+        raise Exception("Both primary and fallback endpoints failed")
 
 class ChatBot:
     """
@@ -767,7 +797,7 @@ class ChatBot:
             self.memory.add_message(AIMessage(content=content))
             
             # Update usage stats (need to make a non-streaming request for this)
-            url = f"{self.API_URL}/chat/completions"
+            url = f"{self.chat_model.current_endpoint}/chat/completions"
             
             # Format messages for stats request
             formatted_messages = []
@@ -779,24 +809,28 @@ class ChatBot:
                 elif isinstance(msg, AIMessage):
                     formatted_messages.append({"role": "assistant", "content": msg.content})
             
-            stats_response = requests.post(
-                url,
-                headers=self.headers,
-                json={
-                    "model": self.model,
-                    "messages": formatted_messages,
-                    "stream": False
-                }
-            )
-            stats_response.raise_for_status()
-            stats_data = stats_response.json()
-            
-            # Update usage stats
-            usage = stats_data.get("usage", {})
-            self.update_stats(
-                usage.get("prompt_tokens", 0),
-                usage.get("completion_tokens", 0)
-            )
+            try:
+                stats_response = self.chat_model._try_request(
+                    url,
+                    self.headers,
+                    {
+                        "model": self.model,
+                        "messages": formatted_messages,
+                        "stream": False
+                    },
+                    stream=False
+                )
+                stats_data = stats_response.json()
+                
+                # Update usage stats
+                usage = stats_data.get("usage", {})
+                self.update_stats(
+                    usage.get("prompt_tokens", 0),
+                    usage.get("completion_tokens", 0)
+                )
+            except Exception as e:
+                debug_print(f"Failed to get usage stats: {str(e)}")
+                console.print("[yellow]Warning: Could not retrieve usage statistics[/yellow]")
             
             return content
             
