@@ -1,39 +1,39 @@
-# Use Python 3.11 slim image as base
-FROM python:3.11-slim
+# Base image
+FROM python:3.12-slim
 
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    MODELS_DIR=/app/storage/models \
+    CONFIG_DIR=/app/storage/config \
+    HISTORY_DIR=/app/storage/history
 
-# Copy requirements first to leverage Docker cache
-COPY requirements.txt .
+# Install system dependencies
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir --upgrade pip
+
+# Setup storage directories
+RUN mkdir -p /app/storage/{models,config,history} \
+    && chmod -R 777 /app/storage
 
 # Install Python dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Create necessary directories and set permissions
-RUN mkdir -p /app/storage/models \
-    /app/storage/config \
-    /app/storage/history \
-    && chmod -R 777 /app/storage
 
 # Copy application code
 COPY pythonchat.py download_model.py ./
 
-# Download the model during build
+# Download model at build time
 RUN python download_model.py
 
-# Set environment variables
-ENV MODELS_DIR=/app/storage/models
-ENV CONFIG_DIR=/app/storage/config
-ENV HISTORY_DIR=/app/storage/history
-
-# Create volume mount points
+# Persistent storage
 VOLUME ["/app/storage/models", "/app/storage/config", "/app/storage/history"]
 
-# Set the default command
+# Run the application
 CMD ["python", "pythonchat.py"]

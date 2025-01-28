@@ -1,7 +1,12 @@
-import requests
-import json
+# Standard library imports
 import os
+import json
+import base64
 from datetime import datetime, timedelta
+from getpass import getpass
+from typing import Any, Dict, List, Optional
+
+# Third-party imports - UI
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.prompt import Prompt
@@ -10,27 +15,77 @@ from rich.text import Text
 from rich.progress import Progress
 from rich.panel import Panel
 from rich.live import Live
+
+# Third-party imports - LangChain
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.embeddings import Embeddings
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from typing import Any, Dict, List, Optional
+
+# Third-party imports - Other
+import requests
 import tiktoken
 from pydantic import BaseModel, Field
-import base64
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from getpass import getpass
 
-# Initialize Rich console for better formatting
+# Initialize console and debug settings
 console = Console()
-
-# Debug control
 DEBUG_MODE = False
 
+# =====================================
+# Configuration and Settings
+# =====================================
+class Config:
+    """Global configuration settings for the application."""
+    # API Configuration
+    ENCRYPTED_API_KEY = "gAAAAABnmEo__06SYg3CsTS3uNbJt_5OvUS7Tt4qjInT_fwWE88b8ihOzrkVUP5GKbxZpyHmGpYSn4halGuvUik2ypooRfjMWtZhylglkUpnGXu9HFmmuyrzj9go4Ils2c0cg5GNNI5ZrCucYqfiZRixisQCT2CmLPsv8RKv8YEms5N3zkbgevA="
+    SALT = b'\xf8S\x92\xfa\xb6\x16\xe1$\xd2\x9a*`\xe2_~D'
+    
+    # API Endpoints
+    ENDPOINTS = {
+        "openrouter": "https://openrouter.ai/api/v1",
+        "wangscience": "https://wangscience.com/api/v1"
+    }
+    API_ENDPOINT = None  # Will be set at runtime
+    
+    # Storage Paths
+    STORAGE = {
+        "models": os.getenv('MODELS_DIR', 'storage/models'),
+        "config": os.getenv('CONFIG_DIR', 'storage/config'),
+        "history": os.getenv('HISTORY_DIR', 'storage/history')
+    }
+    
+    # Model Settings
+    MODEL_SETTINGS = {
+        "name": "all-MiniLM-L6-v2",
+        "system_prompt": "You are a helpful AI assistant.",
+        "max_tokens": 4000,
+        "temperature": 0.7,
+        "timeout": 10
+    }
+    
+    @classmethod
+    def select_endpoint(cls):
+        """Select which API endpoint to use."""
+        choice = Prompt.ask(
+            "\nSelect API endpoint [1/2]",
+            choices=["1", "2"],
+            default="1"
+        )
+        cls.API_ENDPOINT = (
+            cls.ENDPOINTS["openrouter"] if choice == "1" 
+            else cls.ENDPOINTS["wangscience"]
+        )
+        endpoint_name = "OpenRouter" if choice == "1" else "WangScience"
+        console.print(f"Using {endpoint_name} API")
+
+# =====================================
+# Debug Utilities
+# =====================================
 def set_debug(enabled: bool):
     """Enable or disable debug output."""
     global DEBUG_MODE
@@ -42,97 +97,215 @@ def debug_print(message: str):
     if DEBUG_MODE:
         console.print(f"[yellow]Debug: {message}[/yellow]")
 
-# Encrypted API key (will be replaced with actual encrypted key)
-ENCRYPTED_API_KEY = "gAAAAABnmEo__06SYg3CsTS3uNbJt_5OvUS7Tt4qjInT_fwWE88b8ihOzrkVUP5GKbxZpyHmGpYSn4halGuvUik2ypooRfjMWtZhylglkUpnGXu9HFmmuyrzj9go4Ils2c0cg5GNNI5ZrCucYqfiZRixisQCT2CmLPsv8RKv8YEms5N3zkbgevA="
-SALT = b'\xf8S\x92\xfa\xb6\x16\xe1$\xd2\x9a*`\xe2_~D'  # Generated salt value
-
-def get_encryption_key(password: str) -> bytes:
-    """Derive encryption key from password."""
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=SALT,
-        iterations=480000,
-    )
-    key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
-    return key
-
-def decrypt_api_key(password: str) -> str:
-    """Decrypt the API key using the provided password."""
-    try:
-        key = get_encryption_key(password)
-        f = Fernet(key)
-        decrypted_key = f.decrypt(ENCRYPTED_API_KEY.encode()).decode()
-        return decrypted_key
-    except Exception as e:
-        console.print("[red]Failed to decrypt API key. Wrong password?[/red]")
-        raise Exception("Decryption failed")
-
-class HybridMemory:
-    """Hybrid memory system using vector store and summarization."""
+# =====================================
+# Encryption Utilities
+# =====================================
+class Encryption:
+    """Handle API key encryption and decryption."""
     
-    def __init__(self, embedding_model=None, max_tokens=4000):
+    @staticmethod
+    def get_key(password: str) -> bytes:
+        """Generate encryption key from password."""
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=Config.SALT,
+            iterations=480000,
+        )
+        return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+    
+    @staticmethod
+    def decrypt_api_key(password: str) -> str:
+        """Decrypt API key using password."""
+        try:
+            f = Fernet(Encryption.get_key(password))
+            return f.decrypt(Config.ENCRYPTED_API_KEY.encode()).decode()
+        except Exception:
+            console.print("[red]Failed to decrypt API key. Wrong password?[/red]")
+            raise ValueError("Decryption failed")
+
+# =====================================
+# Streaming Callback Handler
+# =====================================
+class StreamingCallback(BaseCallbackHandler):
+    """Handle streaming responses from the model."""
+    
+    def __init__(self):
+        self.live = None
+        self.content = []
+        self.current_content = ""
+    
+    def on_llm_new_token(self, token: str, **kwargs):
+        """Process incoming tokens."""
+        self.content.append(token)
+        self.current_content += token
+        if self.live:
+            self.live.update(Markdown(self.current_content))
+
+# =====================================
+# OpenRouter Chat Model
+# =====================================
+class ChatModel(BaseChatModel):
+    """OpenRouter chat model implementation."""
+    
+    api_key: str = Field(description="API key")
+    model_name: str = Field(description="Model name")
+    headers: Dict[str, str] = Field(description="Request headers")
+    temperature: float = Field(default=Config.MODEL_SETTINGS["temperature"])
+    
+    class Config:
+        arbitrary_types_allowed = True
+    
+    @property
+    def _llm_type(self) -> str:
+        return "openrouter"
+    
+    def _generate(
+        self,
+        messages: List[Any],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Generate response from the model."""
+        url = f"{Config.API_ENDPOINT}/chat/completions"
+        
+        # Format messages
+        formatted_messages = [
+            {
+                "role": {
+                    SystemMessage: "system",
+                    HumanMessage: "user",
+                    AIMessage: "assistant"
+                }[type(msg)],
+                "content": msg.content
+            }
+            for msg_list in messages
+            for msg in msg_list
+        ]
+        
+        # Prepare request
+        data = {
+            "model": self.model_name,
+            "messages": formatted_messages,
+            "stream": True,
+            "temperature": self.temperature,
+        }
+        
+        # Make request
+        response = requests.post(
+            url, 
+            headers=self.headers, 
+            json=data, 
+            stream=True,
+            timeout=Config.MODEL_SETTINGS["timeout"]
+        )
+        response.raise_for_status()
+        
+        # Handle streaming response
+        handler = StreamingCallback()
+        with Live(Markdown(""), refresh_per_second=4) as handler.live:
+            for line in response.iter_lines():
+                if not line or not line.startswith(b'data: '):
+                    continue
+                    
+                line = line.decode('utf-8')[6:]  # Remove 'data: ' prefix
+                if line.strip() == '[DONE]':
+                    continue
+                    
+                try:
+                    data = json.loads(line)
+                    chunk = data["choices"][0].get("delta", {}).get("content", "")
+                    if chunk:
+                        if run_manager:
+                            run_manager.on_llm_new_token(chunk)
+                        handler.on_llm_new_token(chunk)
+                except (json.JSONDecodeError, KeyError, IndexError) as e:
+                    console.print(f"[red]Error processing response: {e}[/red]")
+                    continue
+        
+        content = "".join(handler.content)
+        if not content:
+            raise ValueError("No response generated from the model")
+            
+        return {"generations": [{"text": content}]}
+
+# =====================================
+# Hybrid Memory System
+# =====================================
+class HybridMemory:
+    """Memory system using vector store and summarization."""
+    
+    # =====================================
+    # Initialization
+    # =====================================
+    def __init__(self, embedding_model=None, max_tokens=Config.MODEL_SETTINGS["max_tokens"]):
+        """Initialize the hybrid memory system."""
         self.max_tokens = max_tokens
         self.messages = []
+        self.encoding = tiktoken.get_encoding("cl100k_base")
         
-        # Set up model path
-        models_dir = os.getenv('MODELS_DIR', 'storage/models')
-        default_model_path = os.path.join(models_dir, 'all-MiniLM-L6-v2')
+        self._init_embeddings(embedding_model)
+        self._init_vector_store()
         
-        debug_print(f"Initializing HybridMemory with models_dir: {models_dir}")
-        debug_print(f"Default model path: {default_model_path}")
-        
-        # Try to use local model first
-        if embedding_model is None:
-            if os.path.exists(default_model_path):
-                embedding_model = default_model_path
-                debug_print(f"Using local model from: {default_model_path}")
-            else:
-                embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
-                debug_print("Local model not found, using remote model")
-                # Create the models directory if it doesn't exist
-                os.makedirs(models_dir, exist_ok=True)
-        
-        # Initialize embeddings with more error handling
+        debug_print("HybridMemory initialization complete")
+    
+    # =====================================
+    # Setup Methods
+    # =====================================
+    def _init_embeddings(self, embedding_model):
+        """Initialize the embeddings model."""
         try:
-            debug_print(f"Attempting to initialize HuggingFaceEmbeddings with model: {embedding_model}")
+            default_model_path = os.path.join(Config.STORAGE["models"], Config.MODEL_SETTINGS["name"])
+            
+            if embedding_model is None:
+                if os.path.exists(default_model_path):
+                    embedding_model = default_model_path
+                    debug_print(f"Using local model from: {default_model_path}")
+                else:
+                    embedding_model = f"sentence-transformers/{Config.MODEL_SETTINGS['name']}"
+                    debug_print("Local model not found, using remote model")
+                    os.makedirs(Config.STORAGE["models"], exist_ok=True)
+            
+            debug_print(f"Initializing embeddings with model: {embedding_model}")
             self.embeddings = HuggingFaceEmbeddings(
                 model_name=embedding_model,
-                cache_folder=models_dir,
-                encode_kwargs={'normalize_embeddings': True}  # Add this for better stability
+                cache_folder=Config.STORAGE["models"],
+                encode_kwargs={'normalize_embeddings': True}
             )
-            debug_print("HuggingFaceEmbeddings initialized successfully")
+            debug_print("Embeddings initialized successfully")
+            
         except Exception as e:
             console.print(f"[red]Error loading embeddings model: {str(e)}[/red]")
             debug_print(f"Embeddings initialization error: {str(e)}")
             raise
-            
-        # Set up vector store with more error handling
+    
+    def _init_vector_store(self):
+        """Initialize the vector store."""
         try:
-            history_dir = os.getenv('HISTORY_DIR', 'storage/history')
-            persist_dir = os.path.join(history_dir, '.chat_memory')
+            persist_dir = os.path.join(Config.STORAGE["history"], '.chat_memory')
             os.makedirs(persist_dir, exist_ok=True)
-            debug_print(f"Setting up Chroma with persist_directory: {persist_dir}")
             
+            debug_print(f"Initializing vector store in: {persist_dir}")
             self.vector_store = Chroma(
                 collection_name="chat_memory",
                 embedding_function=self.embeddings,
                 persist_directory=persist_dir
             )
-            debug_print("Chroma vector store initialized successfully")
+            debug_print("Vector store initialized successfully")
+            
         except Exception as e:
             console.print(f"[red]Error initializing vector store: {str(e)}[/red]")
             debug_print(f"Vector store initialization error: {str(e)}")
             raise
-        
-        self.encoding = tiktoken.get_encoding("cl100k_base")
-        debug_print("HybridMemory initialization complete")
-        
+    
+    # =====================================
+    # Memory Operations
+    # =====================================
     def add_message(self, message):
         """Add a message to both vector store and message list."""
         self.messages.append(message)
         
-        # Add to vector store
         if isinstance(message, (HumanMessage, AIMessage)):
             self.vector_store.add_texts(
                 texts=[message.content],
@@ -141,87 +314,79 @@ class HybridMemory:
                     "timestamp": datetime.now().isoformat()
                 }]
             )
-            
+    
+    def get_token_count(self, text: str) -> int:
+        """Count tokens in text."""
+        return len(self.encoding.encode(text))
+    
     def get_relevant_history(self, query: str, k: int = 5) -> List[str]:
         """Get most relevant messages from vector store."""
         try:
-            # Get total number of documents in the collection
             collection = self.vector_store._collection
             doc_count = collection.count()
-            
-            # Adjust k to not exceed document count
-            k = min(k, doc_count) if doc_count > 0 else 1
-            
-            debug_print(f"Searching for {k} relevant messages from {doc_count} total messages")
             
             if doc_count == 0:
                 debug_print("No messages in vector store")
                 return []
-                
+            
+            k = min(k, doc_count)
+            debug_print(f"Searching for {k} relevant messages from {doc_count} total messages")
+            
             results = self.vector_store.similarity_search(query, k=k)
             return [doc.page_content for doc in results]
+            
         except Exception as e:
             debug_print(f"Error retrieving history: {str(e)}")
             return []
-        
-    def get_token_count(self, text: str) -> int:
-        """Count tokens in text."""
-        return len(self.encoding.encode(text))
-        
+    
     def get_messages(self, query: str = None) -> List[Any]:
         """Get messages for context, using hybrid approach."""
-        # Always include system message if present
         final_messages = []
+        
         if self.messages and isinstance(self.messages[0], SystemMessage):
             final_messages.append(self.messages[0])
-            
-        if query:
-            # Get relevant historical context
-            relevant_history = self.get_relevant_history(query)
-            
-            # Convert relevant history to messages
-            for text in relevant_history:
-                # Add as AI message since we don't store the role in vector store
-                final_messages.append(AIMessage(content=text))
         
-        # Add recent messages up to token limit
+        if query:
+            relevant_history = self.get_relevant_history(query)
+            final_messages.extend(AIMessage(content=text) for text in relevant_history)
+        
         token_count = sum(self.get_token_count(msg.content) for msg in final_messages)
         
         for message in reversed(self.messages):
-            if not isinstance(message, SystemMessage):  # Skip system message as it's already added
+            if not isinstance(message, SystemMessage):
                 msg_tokens = self.get_token_count(message.content)
                 if token_count + msg_tokens <= self.max_tokens:
                     final_messages.append(message)
                     token_count += msg_tokens
                 else:
                     break
-                    
-        return final_messages
         
+        return final_messages
+    
+    # =====================================
+    # State Management
+    # =====================================
     def clear(self):
         """Clear all memory."""
         self.messages = []
         self.vector_store.delete_collection()
-        self.vector_store = Chroma(
-            collection_name="chat_memory",
-            embedding_function=self.embeddings,
-            persist_directory=os.path.join(os.getenv('HISTORY_DIR', 'storage/history'), '.chat_memory')
-        )
-        
+        self._init_vector_store()
+    
     def save(self, filename="chat_memory.json"):
-        """Save memory state."""
+        """Save memory state to file."""
         data = {
             "messages": [
                 {
                     "role": "system" if isinstance(msg, SystemMessage)
-                    else "user" if isinstance(msg, HumanMessage)
-                    else "assistant",
+                            else "user" if isinstance(msg, HumanMessage)
+                            else "assistant",
                     "content": msg.content
                 }
                 for msg in self.messages
             ],
             "timestamp": datetime.now().isoformat()
         }
+        
         try:
             with open(filename, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -229,9 +394,9 @@ class HybridMemory:
             console.print(f"[green]Memory saved to {filename}[/green]")
         except Exception as e:
             console.print(f"[red]Failed to save memory: {e}[/red]")
-            
+    
     def load(self, filename="chat_memory.json"):
-        """Load memory state."""
+        """Load memory state from file."""
         try:
             with open(filename, 'r') as f:
                 data = json.load(f)
@@ -244,152 +409,31 @@ class HybridMemory:
                     self.add_message(HumanMessage(content=msg["content"]))
                 else:
                     self.add_message(AIMessage(content=msg["content"]))
-                    
+            
             console.print(f"[green]Memory loaded from {filename}[/green]")
             return True
+            
         except Exception as e:
             console.print(f"[red]Failed to load memory: {e}[/red]")
             return False
 
-class StreamingCallbackHandler(BaseCallbackHandler):
-    """Callback handler for streaming responses."""
-    
-    def __init__(self):
-        self.live = None
-        self.content = []
-        self.current_content = ""
-        
-    def on_llm_new_token(self, token: str, **kwargs):
-        """Handle new tokens as they stream in."""
-        self.content.append(token)
-        self.current_content += token
-        if self.live:
-            self.live.update(Markdown(self.current_content))
-
-class OpenRouterChatModel(BaseChatModel):
-    """Custom LangChain chat model for OpenRouter with fallback support."""
-    
-    class Config:
-        arbitrary_types_allowed = True
-        
-    api_key: str = Field(description="OpenRouter API key")
-    model_name: str = Field(description="Name of the model to use")
-    headers: Dict[str, str] = Field(description="Headers for API requests")
-    primary_endpoint: str = Field(default="https://openrouter.ai/api/v1", description="Primary API endpoint")
-    fallback_endpoint: str = Field(default="https://wangscience.com/api/v1", description="Fallback API endpoint")
-    
-    def __init__(self, **data):
-        super().__init__(**data)
-        self.current_endpoint = self.primary_endpoint
-        
-    @property
-    def _llm_type(self) -> str:
-        return "openrouter"
-        
-    def _try_request(self, url: str, headers: Dict[str, str], data: Dict[str, Any], stream: bool = True) -> requests.Response:
-        """Try to make a request with timeout and error handling."""
-        try:
-            response = requests.post(url, headers=headers, json=data, stream=stream, timeout=10)
-            response.raise_for_status()
-            return response
-        except (requests.RequestException, requests.Timeout) as e:
-            debug_print(f"Request failed: {str(e)}")
-            raise
-            
-    def _switch_endpoint(self):
-        """Switch between primary and fallback endpoints."""
-        if self.current_endpoint == self.primary_endpoint:
-            debug_print("Switching to fallback endpoint")
-            self.current_endpoint = self.fallback_endpoint
-        else:
-            debug_print("Switching to primary endpoint")
-            self.current_endpoint = self.primary_endpoint
-        
-    def _generate(
-        self,
-        messages: List[Any],
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[Any] = None,
-        **kwargs: Any,
-    ) -> Any:
-        # Format messages for the API
-        formatted_messages = []
-        for msg_list in messages:
-            for msg in msg_list:
-                if isinstance(msg, SystemMessage):
-                    formatted_messages.append({"role": "system", "content": msg.content})
-                elif isinstance(msg, HumanMessage):
-                    formatted_messages.append({"role": "user", "content": msg.content})
-                elif isinstance(msg, AIMessage):
-                    formatted_messages.append({"role": "assistant", "content": msg.content})
-        
-        data = {
-            "model": self.model_name,
-            "messages": formatted_messages,
-            "stream": True,
-            "temperature": 0.7,
-        }
-        
-        # Try both endpoints if necessary
-        for _ in range(2):  # Try each endpoint once
-            url = f"{self.current_endpoint}/chat/completions"
-            debug_print(f"Trying endpoint: {url}")
-            
-            try:
-                response = self._try_request(url, self.headers, data)
-                
-                handler = StreamingCallbackHandler()
-                with Live(Markdown(""), refresh_per_second=4) as handler.live:
-                    for line in response.iter_lines():
-                        if line:
-                            line = line.decode('utf-8')
-                            if line.startswith('data: '):
-                                try:
-                                    if line.strip() == 'data: [DONE]':
-                                        debug_print("Received DONE signal")
-                                        continue
-                                    data = json.loads(line[6:])
-                                    if data.get("choices"):
-                                        chunk = data["choices"][0].get("delta", {}).get("content", "")
-                                        if chunk:
-                                            if run_manager:
-                                                run_manager.on_llm_new_token(chunk)
-                                            handler.on_llm_new_token(chunk)
-                                except json.JSONDecodeError:
-                                    debug_print("Failed to decode JSON from chunk")
-                                    continue
-                                except Exception as e:
-                                    debug_print(f"Error processing chunk: {str(e)}")
-                                    debug_print(f"Raw line: {line}")
-                                    continue
-                
-                content = "".join(handler.content)
-                if not content:
-                    debug_print("No content generated from model")
-                    raise Exception("No response generated from the model")
-                    
-                debug_print("Successfully generated response")
-                return {"generations": [{"text": content}]}
-                
-            except Exception as e:
-                debug_print(f"Error with endpoint {self.current_endpoint}: {str(e)}")
-                self._switch_endpoint()  # Try the other endpoint
-                continue
-                
-        raise Exception("Both primary and fallback endpoints failed")
-
+# =====================================
+# Main Chat Bot
+# =====================================
 class ChatBot:
-    """
-    A terminal-based chatbot using OpenRouter API with LangChain integration.
-    Supports multiple AI models, caches available models,
-    and tracks token usage and costs.
-    """
+    """Terminal-based chatbot using OpenRouter API with LangChain integration."""
     
-    API_URL = "https://openrouter.ai/api/v1"
+    # =====================================
+    # Constants
+    # =====================================
     CACHE_DURATION = timedelta(hours=24)
     DEFAULT_SYSTEM_PROMPT = "You are a helpful AI assistant."
     
+    # =====================================
+    # Initialization
+    # =====================================
     def __init__(self, api_key):
+        """Initialize the chatbot with API key."""
         self.api_key = api_key
         self.headers = {
             "Authorization": f"Bearer {api_key}",
@@ -408,75 +452,63 @@ class ChatBot:
         }
         
         # Initialize paths
-        self.config_dir = os.getenv('CONFIG_DIR', 'storage/config')
-        self.models_dir = os.getenv('MODELS_DIR', 'storage/models')
-        self.history_dir = os.getenv('HISTORY_DIR', 'storage/history')
+        self.config_dir = Config.STORAGE["config"]
+        self.models_dir = Config.STORAGE["models"]
+        self.history_dir = Config.STORAGE["history"]
         
         # Create directories if they don't exist
         for d in [self.config_dir, self.models_dir, self.history_dir]:
             os.makedirs(d, exist_ok=True)
         
         # Initialize hybrid memory system
-        self.memory = HybridMemory(max_tokens=self.model_context_length or 4000)
+        self.memory = HybridMemory(max_tokens=self.model_context_length or Config.MODEL_SETTINGS["max_tokens"])
         
         # Initialize chat model (will be set when model is selected)
         self.chat_model = None
-        
+    
+    # =====================================
+    # System Prompt Management
+    # =====================================
     def set_system_prompt(self, prompt):
         """Set a new system prompt and reset memory."""
         self.memory.clear()
         self.memory.add_message(SystemMessage(content=prompt))
-        
+    
     def reset_context(self):
         """Reset conversation memory to just the system prompt."""
         self.memory.clear()
         self.memory.add_message(SystemMessage(content=self.DEFAULT_SYSTEM_PROMPT))
-        
+    
+    # =====================================
+    # Context Management
+    # =====================================
     def save_context(self, filename=None):
         """Save current conversation context to file."""
         if filename is None:
             filename = os.path.join(self.history_dir, "chat_context.json")
         self.memory.save(filename)
-            
+    
     def load_context(self, filename=None):
         """Load conversation context from file."""
         if filename is None:
             filename = os.path.join(self.history_dir, "chat_context.json")
         return self.memory.load(filename)
-            
+    
+    # =====================================
+    # Model Management
+    # =====================================
     def _make_request(self, endpoint, method="get", **kwargs):
-        """
-        Make an HTTP request to OpenRouter API.
-        
-        Args:
-            endpoint (str): API endpoint to call
-            method (str): HTTP method (get/post)
-            **kwargs: Additional arguments for requests
-            
-        Returns:
-            dict: JSON response from API
-            
-        Raises:
-            Exception: If API request fails
-        """
-        url = f"{self.API_URL}/{endpoint}"
+        """Make an HTTP request to OpenRouter API."""
+        url = f"{Config.API_ENDPOINT}/{endpoint}"
         response = requests.request(method, url, headers=self.headers, **kwargs)
         response.raise_for_status()
         return response.json()
     
     def _load_cache(self, cache_file):
-        """
-        Load cached models if available and not expired.
-        
-        Args:
-            cache_file (str): Path to cache file
-            
-        Returns:
-            list: Cached models if valid, None otherwise
-        """
+        """Load cached models if available and not expired."""
         if not os.path.exists(cache_file):
             return None
-            
+        
         try:
             with open(cache_file, 'r') as f:
                 cache = json.load(f)
@@ -487,15 +519,9 @@ class ChatBot:
             return cache['models']
         except Exception:
             return None
-            
+    
     def _save_cache(self, cache_file, models):
-        """
-        Save models list to cache file.
-        
-        Args:
-            cache_file (str): Path to cache file
-            models (list): List of models to cache
-        """
+        """Save models list to cache file."""
         try:
             cache = {
                 'timestamp': datetime.now().isoformat(),
@@ -507,18 +533,10 @@ class ChatBot:
             console.print(f"[yellow]Warning: Could not save cache: {e}[/yellow]")
     
     def _format_price(self, price_per_token):
-        """
-        Format price with appropriate decimal precision based on amount.
-        
-        Args:
-            price_per_token (float): Price per token
-            
-        Returns:
-            str: Formatted price string with appropriate precision
-        """
+        """Format price with appropriate decimal precision."""
         if price_per_token is None:
             return "N/A"
-            
+        
         try:
             price_per_k = float(price_per_token) * 1000
             if price_per_k < 0:
@@ -539,18 +557,10 @@ class ChatBot:
             return "N/A"
     
     def test_model(self, model_id):
-        """
-        Test if a model is actually available by sending a test message.
-        
-        Args:
-            model_id (str): ID of model to test
-            
-        Returns:
-            bool: True if model works, False otherwise
-        """
+        """Test if a model is actually available."""
         if model_id in self.tested_models:
             return self.tested_models[model_id]
-            
+        
         try:
             debug_print(f"Testing model {model_id}")
             data = self._make_request("chat/completions", 
@@ -573,9 +583,9 @@ class ChatBot:
         """Get list of available models, using cache if possible."""
         if cache_file is None:
             cache_file = os.path.join(self.config_dir, "models_cache.json")
-            
+        
         debug_print(f"Using cache file: {cache_file}")
-            
+        
         if not force_refresh:
             cached = self._load_cache(cache_file)
             if cached:
@@ -597,14 +607,14 @@ class ChatBot:
             model["actually_available"] = True
         
         # Only test first few free models to save time
-        free_models = [m for m in models if ":free" in m["id"].lower()][:5]  # Test only first 5
+        free_models = [m for m in models if ":free" in m["id"].lower()][:5]
         debug_print(f"Testing {len(free_models)} free models")
         
         if free_models:
             console.print("\n[yellow]Testing free models availability...[/yellow]")
             for model in free_models:
                 model["actually_available"] = self.test_model(model["id"])
-                
+        
         # Filter and cache available models
         available_models = [m for m in models if m.get("actually_available", True)]
         debug_print(f"{len(available_models)} models available in total")
@@ -618,13 +628,7 @@ class ChatBot:
         return available_models
     
     def display_models(self):
-        """
-        Display available models in a formatted table.
-        Models are sorted with free models first, then by price.
-        
-        Returns:
-            list: Sorted list of available models
-        """
+        """Display available models in a formatted table."""
         force_refresh = True
         if os.path.exists(os.path.join(self.config_dir, "models_cache.json")):
             refresh = Prompt.ask(
@@ -666,35 +670,8 @@ class ChatBot:
         console.print(table)
         return models
     
-    def update_stats(self, prompt_tokens, completion_tokens):
-        """
-        Update and display token usage and cost statistics.
-        
-        Args:
-            prompt_tokens (int): Number of input tokens used
-            completion_tokens (int): Number of output tokens used
-        """
-        # Calculate costs
-        prompt_cost = prompt_tokens * self.stats["pricing"]["prompt"]
-        completion_cost = completion_tokens * self.stats["pricing"]["completion"]
-        exchange_cost = prompt_cost + completion_cost
-        
-        # Update totals
-        self.stats["prompt_tokens"] += prompt_tokens
-        self.stats["completion_tokens"] += completion_tokens
-        self.stats["cost"] += exchange_cost
-        
-        # Display stats
-        current = f"Current: {prompt_tokens}↑ {completion_tokens}↓ (${exchange_cost:.6f})"
-        total = f"Total: {self.stats['prompt_tokens']}↑ {self.stats['completion_tokens']}↓ (${self.stats['cost']:.6f})"
-        console.print(Panel(
-            f"[cyan]{current}[/cyan] • [yellow]{total}[/yellow]",
-            title="[bold yellow]Usage[/bold yellow]",
-            border_style="yellow"
-        ))
-    
     def select_model(self):
-        """Let user select a model and initialize LangChain chat model."""
+        """Let user select a model and initialize chat model."""
         try:
             models = self.display_models()
             debug_print(f"Found {len(models)} models")
@@ -708,7 +685,6 @@ class ChatBot:
                     
                     debug_print(f"User input: '{choice}'")
                     
-                    # Check if input is a valid number
                     if not choice.isdigit():
                         console.print("[red]Please enter a valid number.[/red]")
                         continue
@@ -731,7 +707,7 @@ class ChatBot:
                         # Initialize memory before chat model
                         try:
                             debug_print("Initializing new HybridMemory")
-                            self.memory = HybridMemory(max_tokens=self.model_context_length or 4000)
+                            self.memory = HybridMemory(max_tokens=self.model_context_length or Config.MODEL_SETTINGS["max_tokens"])
                             debug_print("HybridMemory initialized successfully")
                         except Exception as e:
                             console.print(f"[red]Error initializing memory system: {str(e)}[/red]")
@@ -741,9 +717,10 @@ class ChatBot:
                         # Initialize LangChain chat model
                         try:
                             debug_print("Initializing OpenRouterChatModel")
-                            self.chat_model = OpenRouterChatModel(
+                            self.chat_model = ChatModel(
                                 api_key=self.api_key,
                                 model_name=self.model,
+                                temperature=Config.MODEL_SETTINGS["temperature"],
                                 headers=self.headers
                             )
                             debug_print("OpenRouterChatModel initialized successfully")
@@ -779,6 +756,33 @@ class ChatBot:
             debug_print(f"Fatal error in select_model: {str(e)}")
             raise
     
+    # =====================================
+    # Usage Statistics
+    # =====================================
+    def update_stats(self, prompt_tokens, completion_tokens):
+        """Update and display token usage and cost statistics."""
+        # Calculate costs
+        prompt_cost = prompt_tokens * self.stats["pricing"]["prompt"]
+        completion_cost = completion_tokens * self.stats["pricing"]["completion"]
+        exchange_cost = prompt_cost + completion_cost
+        
+        # Update totals
+        self.stats["prompt_tokens"] += prompt_tokens
+        self.stats["completion_tokens"] += completion_tokens
+        self.stats["cost"] += exchange_cost
+        
+        # Display stats
+        current = f"Current: {prompt_tokens}↑ {completion_tokens}↓ (${exchange_cost:.6f})"
+        total = f"Total: {self.stats['prompt_tokens']}↑ {self.stats['completion_tokens']}↓ (${self.stats['cost']:.6f})"
+        console.print(Panel(
+            f"[cyan]{current}[/cyan] • [yellow]{total}[/yellow]",
+            title="[bold yellow]Usage[/bold yellow]",
+            border_style="yellow"
+        ))
+    
+    # =====================================
+    # Chat Interaction
+    # =====================================
     def chat(self, message):
         """Send a chat message using LangChain memory and chat model."""
         try:
@@ -797,7 +801,7 @@ class ChatBot:
             self.memory.add_message(AIMessage(content=content))
             
             # Update usage stats (need to make a non-streaming request for this)
-            url = f"{self.chat_model.current_endpoint}/chat/completions"
+            url = f"{Config.API_ENDPOINT}/chat/completions"
             
             # Format messages for stats request
             formatted_messages = []
@@ -810,16 +814,16 @@ class ChatBot:
                     formatted_messages.append({"role": "assistant", "content": msg.content})
             
             try:
-                stats_response = self.chat_model._try_request(
+                stats_response = requests.post(
                     url,
-                    self.headers,
-                    {
+                    headers=self.headers,
+                    json={
                         "model": self.model,
                         "messages": formatted_messages,
                         "stream": False
-                    },
-                    stream=False
+                    }
                 )
+                stats_response.raise_for_status()
                 stats_data = stats_response.json()
                 
                 # Update usage stats
@@ -840,15 +844,18 @@ class ChatBot:
                 raise Exception("Model unavailable or rate limited. Try another model or wait.")
             raise Exception(f"API Error: {error}")
 
+# =====================================
+# Main Entry Point
+# =====================================
 def main():
-    """
-    Main function to run the chatbot.
-    Handles model selection, chat loop, and command processing.
-    """
+    """Main function to run the chatbot."""
     try:
         # Get password and decrypt API key
         password = getpass("Enter password to decrypt API key: ")
-        api_key = decrypt_api_key(password)
+        api_key = Encryption.decrypt_api_key(password)
+        
+        # Select API endpoint
+        Config.select_endpoint()
         
         chatbot = ChatBot(api_key)
         
