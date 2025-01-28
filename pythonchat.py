@@ -256,19 +256,18 @@ class HybridMemory:
     def _init_embeddings(self, embedding_model):
         """Initialize the embeddings model."""
         try:
-            default_model_path = os.path.join(Config.STORAGE["models"], Config.MODEL_SETTINGS["name"])
-            
             if embedding_model is None:
-                if os.path.exists(default_model_path):
-                    embedding_model = default_model_path
-                    debug_print(f"Using local model from: {default_model_path}")
-                else:
-                    embedding_model = f"sentence-transformers/{Config.MODEL_SETTINGS['name']}"
-                    debug_print("Local model not found, using remote model")
-                    os.makedirs(Config.STORAGE["models"], exist_ok=True)
+                embedding_model = os.path.join(Config.STORAGE["models"], Config.MODEL_SETTINGS["name"])
             
-            debug_print(f"Initializing embeddings with model: {embedding_model}")
-            self.embeddings = SentenceTransformer(embedding_model)
+            if not os.path.exists(embedding_model):
+                raise ValueError(
+                    f"Model not found at {embedding_model}. "
+                    "The model should be included in the Docker image. "
+                    "Please ensure you're using the correct image from the registry."
+                )
+            
+            debug_print(f"Initializing embeddings with local model: {embedding_model}")
+            self.embeddings = SentenceTransformer(embedding_model, device="cpu")
             debug_print("Embeddings initialized successfully")
             
         except Exception as e:
@@ -456,22 +455,12 @@ class ChatBot:
         for d in [self.config_dir, self.models_dir, self.history_dir]:
             os.makedirs(d, exist_ok=True)
         
-        # Initialize hybrid memory system
-        self.memory = HybridMemory(max_tokens=self.model_context_length or Config.MODEL_SETTINGS["max_tokens"])
+        # Initialize hybrid memory system with local model path
+        model_path = os.path.join(Config.STORAGE["models"], Config.MODEL_SETTINGS["name"])
+        self.memory = HybridMemory(embedding_model=model_path, max_tokens=self.model_context_length or Config.MODEL_SETTINGS["max_tokens"])
         
         # Initialize chat model (will be set when model is selected)
         self.chat_model = None
-        
-        # Initialize embeddings with local model
-        model_path = os.path.join(Config.STORAGE["models"], Config.MODEL_SETTINGS["name"])
-        self.embeddings = SentenceTransformer(model_path)
-        
-        # Initialize vector store
-        self.vector_store = Chroma(
-            collection_name="chat_history",
-            embedding_function=self.embeddings,
-            persist_directory=os.path.join(Config.STORAGE["models"], "chroma")
-        )
     
     # =====================================
     # System Prompt Management
